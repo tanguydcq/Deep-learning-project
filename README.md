@@ -1,199 +1,211 @@
-# Diffusion Model - DDPM Implementation
+# 🎨 Implémentation de Concept Sliders sur CryptoPunks
 
-Une implémentation de **Denoising Diffusion Probabilistic Models (DDPM)** en PyTorch pour la génération d'images sur MNIST et CryptoPunks.
+> Tentative de reproduction de la méthode "Concept Sliders" pour la génération conditionnelle de CryptoPunks.
 
-## 📋 Description
+## 🎯 Objectif du Projet
 
-Ce projet implémente un modèle de diffusion capable de générer des images à partir de bruit aléatoire. Il inclut :
+Ce projet vise à **reproduire la méthode "Concept Sliders"** décrite dans le papier :
 
-- Un modèle simple (SimpleUNet) pour MNIST
-- Un modèle complexe (UNet avec attention) pour CryptoPunks
-- Multiple configurations d'entraînement
-- Scripts de training et d'inférence
-- Génération de GIFs montrant le processus de diffusion/débruitage
+> **Concept Sliders: LoRA Adaptors for Precise Control in Diffusion Models**  
+> Gandikota et al., 2023 ([arXiv:2311.17216](https://arxiv.org/abs/2311.17216))
 
-## 🚀 Installation
+L'idée est d'apprendre des **vecteurs concepts** qui permettent de contrôler des attributs sémantiques (accessoires : casquette, pipe, cigarette, hoodie) dans un modèle de diffusion, sans réentraîner le modèle complet.
 
-### Prérequis
+---
 
-- Python 3.8+
-- CUDA (optionnel, recommandé pour l'entraînement)
+## 🏗️ Méthodologie Implémentée
 
-### Installation des dépendances
+### Étape 1 : Entraînement du DDPM de base
+
+Entraînement d'un UNet pour prédire le bruit `ε` avec un concept vector nul (`c = 0`).
+
+```
+Loss : min_θ E||ε - ε_θ(x_t, t, c=0)||²
+```
+
+**Fichiers :**
+- [src/model_vector.py](src/model_vector.py) : Architecture UNet avec injection de concept au bottleneck
+- [src/train_ddpm.py](src/train_ddpm.py) : Script d'entraînement du DDPM de base
+- [src/diffusion.py](src/diffusion.py) : Processus de diffusion (forward/reverse)
+
+### Étape 2 : Apprentissage des Concept Vectors
+
+Après avoir gelé le modèle DDPM pré-entraîné, on optimise un vecteur `c_k` pour chaque concept (accessoire) sur un sous-ensemble d'images filtré.
+
+```
+Loss : min_{c_k} E||ε - ε_θ(x_t, t, c_k)||²
+```
+
+L'injection se fait au bottleneck du UNet :
+```
+h' = h + α · c_k
+```
+
+où `h` est la représentation latente (512D) et `α` est un facteur d'échelle.
+
+**Fichiers :**
+- [src/train_concepts.py](src/train_concepts.py) : Optimisation des vecteurs concepts
+- [src/create_subdatasets.py](src/create_subdatasets.py) : Création des sous-datasets par accessoire
+- `concepts/` : Vecteurs concepts sauvegardés (`acc_cap.pt`, `acc_pipe.pt`, etc.)
+
+### Étape 3 : Génération avec Combinaison de Concepts
+
+À l'inférence, on combine linéairement les concepts :
+```
+c = Σ_k β_k · c_k
+```
+
+**Fichiers :**
+- [src/generate_concepts.py](src/generate_concepts.py) : Génération avec injection de concepts
+- [src/generate_with_concepts.py](src/generate_with_concepts.py) : Interface de génération
+
+---
+
+## ❌ Problème Rencontré : Échec de l'Apprentissage
+
+### Observation
+
+Pendant l'entraînement des concept vectors, **la norme des vecteurs `c_k` augmentait continuellement** au lieu de converger vers une représentation stable.
+
+```
+Epoch 1:   |c| = 0.05
+Epoch 10:  |c| = 2.3
+Epoch 50:  |c| = 15.7
+Epoch 100: |c| = 45.2   ← divergence
+```
+
+### Analyse
+
+Les vecteurs concepts n'arrivaient pas à apprendre correctement dans l'espace latent `h` du bottleneck :
+
+1. **Espace non structuré** : Le modèle DDPM a été entraîné avec `c = 0`, donc l'espace latent n'a jamais été exposé à des variations de concepts. L'injection additive `h' = h + α·c` perturbe un espace qui n'a pas été conçu pour ça.
+
+2. **Optimisation instable** : Sans contrainte, l'optimiseur pousse `||c_k||` → ∞ pour minimiser la loss, car augmenter la norme permet de "forcer" le modèle à produire des prédictions plus proches des images cibles.
+
+3. **Pas de régularisation** : Contrairement au papier original qui utilise des LoRA (faible rang, régularisation implicite), notre approche avec un vecteur dense 512D n'a pas de contrainte structurelle.
+
+4. **Distribution des features** : L'injection `h + α·c` peut faire sortir les features de leur distribution d'entraînement, causant des artefacts.
+
+### Tentatives de correction (sans succès)
+
+- Régularisation L2 sur `||c_k||`
+- Diminution du learning rate
+- Early stopping basé sur la norme
+- Différentes valeurs de `α` (concept_scale)
+
+---
+
+## 📁 Structure du Projet
+
+```
+.
+├── concepts/                       # Vecteurs concepts (tentative échouée)
+│   ├── acc_cap.pt
+│   ├── acc_cigarette.pt
+│   ├── acc_hoodie.pt
+│   └── acc_pipe.pt
+├── models/
+│   └── CRYPTOPUNKS/                # Modèle DDPM de base
+│       └── cryptopunks1/
+│           └── ckpt_final.pt
+├── src/
+│   ├── model_vector.py             # UNet avec injection concept
+│   ├── train_ddpm.py               # Entraînement DDPM (c=0)
+│   ├── train_concepts.py           # Apprentissage concepts (ÉCHEC)
+│   ├── generate_concepts.py        # Génération avec concepts
+│   ├── diffusion.py                # Process de diffusion
+│   └── config.py                   # Configurations
+└── runs/                           # Logs TensorBoard
+```
+
+---
+
+## ⚙️ Configuration
+
+| Paramètre | Valeur | Description |
+|-----------|--------|-------------|
+| `T` | 1000 | Nombre de timesteps de diffusion |
+| `img_size` | 32 | Taille des images (32×32) |
+| `concept_dim` | 512 | Dimension des vecteurs concepts |
+| `concept_scale` | 1.0 | Facteur α pour l'injection |
+| `lr` (concepts) | 1e-3 | Learning rate pour l'apprentissage des concepts |
+| `init_std` | 0.01 | Écart-type d'initialisation `c ~ N(0, σ²)` |
+
+---
+
+## 🚀 Utilisation
+
+### 1. Entraîner le DDPM de base
 
 ```bash
-pip install torch torchvision tqdm tensorboard imageio numpy pillow matplotlib
+python src/train_ddpm.py --config cryptopunks1 --epochs 100
 ```
 
-## 📁 Structure du projet
-
-```
-Diffusion/
-├── config.py              # Configurations d'entraînement
-├── dataset.py             # Chargement des datasets
-├── diffusion.py           # Processus de diffusion/débruitage
-├── model.py               # Architectures UNet
-├── train.py               # Script d'entraînement
-├── infer.py               # Script d'inférence
-├── utils.py               # Fonctions utilitaires
-├── download_cryptopunks.py # Script pour télécharger CryptoPunks
-├── training.ipynb         # Notebook Jupyter pour expérimentation
-└── README.md              # Ce fichier
-```
-
-## 🎯 Utilisation
-
-### Entraînement
-
-Pour entraîner un modèle avec une configuration spécifique :
+### 2. Créer les sous-datasets par accessoire
 
 ```bash
-# Configuration 1 (baseline) pour MNIST
-python train.py --config config1_mnist
-
-# Configuration 2 (fast prototyping) pour MNIST
-python train.py --config config2_mnist
-
-# Configuration 3 (high precision) pour MNIST
-python train.py --config config3_mnist
-
-# Pour CryptoPunks
-python train.py --config config1_cryptopunks
+python src/create_subdatasets.py
 ```
 
-Les modèles sont sauvegardés dans `models/DATASET/CONFIG_NAME/`.
-
-### Inférence
-
-Pour générer des images et des GIFs avec un modèle entraîné :
+### 3. Apprendre un concept (résultats non satisfaisants)
 
 ```bash
-# Génération avec MNIST
-python infer.py --config config1_mnist
-
-# Génération avec CryptoPunks
-python infer.py --config config1_cryptopunks
+python src/train_concepts.py \
+    --checkpoint models/CRYPTOPUNKS/cryptopunks1/ckpt_final.pt \
+    --concept cap \
+    --epochs 100
 ```
 
-Les résultats sont sauvegardés dans `results/DATASET/CONFIG_NAME/` :
-
-- `noise.gif` : Visualisation du processus de bruitage
-- `sampling.gif` : Visualisation du processus de débruitage
-- `sampling.jpg` : Images générées finales
-
-### Interface Web (Streamlit)
-
-Une interface Streamlit permet de lancer rapidement des entraînements, visualiser les checkpoints, et générer des images (y compris le générateur CryptoPunk intégré).
-
-Pour lancer le dashboard (Windows PowerShell) :
-
-```powershell
-# Activer l'environnement virtuel
-.venv\Scripts\Activate.ps1
-
-# Lancer Streamlit
-streamlit run streamlit_dashboard.py
-```
-
-Ou depuis l'invite de commandes (cmd.exe) :
-
-```bat
-:: Activer l'environnement virtuel
-.venv\Scripts\activate.bat
-
-:: Lancer Streamlit
-streamlit run streamlit_dashboard.py
-```
-
-Après démarrage Streamlit, l'application est disponible localement (par défaut) sur http://localhost:8501. Utilise l'onglet "Training" pour démarrer un entraînement et "Inference" pour générer des images.
-
-### Télécharger CryptoPunks
+### 4. Générer avec concepts
 
 ```bash
-python download_cryptopunks.py
+python src/generate_concepts.py \
+    --checkpoint models/CRYPTOPUNKS/cryptopunks1/ckpt_final.pt \
+    --concepts cap pipe \
+    --weights 1.0 0.5 \
+    --n 4
 ```
 
-## ⚙️ Configurations disponibles
-
-### MNIST
-
-| Config        | T (steps) | Epochs | LR   | Beta Schedule | Description            |
-| ------------- | --------- | ------ | ---- | ------------- | ---------------------- |
-| config1_mnist | 1000      | 100    | 3e-4 | 1e-4 → 0.02   | Baseline standard DDPM |
-| config2_mnist | 300       | 100    | 3e-4 | 1e-4 → 0.02   | Prototypage rapide     |
-| config3_mnist | 1000      | 100    | 2e-4 | 1e-4 → 0.01   | Haute précision        |
-
-### CryptoPunks
-
-| Config              | T (steps) | Epochs | LR   | Beta Schedule | Description            |
-| ------------------- | --------- | ------ | ---- | ------------- | ---------------------- |
-| config1_cryptopunks | 1000      | 100    | 3e-4 | 1e-4 → 0.02   | Baseline standard DDPM |
-
-## 🏗️ Architecture
-
-### SimpleUNet (MNIST)
-
-- Architecture légère pour images 16x16 en niveaux de gris
-- Encodeur-décodeur avec skip connections
-- Time embedding simple
-
-### UNet (CryptoPunks)
-
-- Architecture complète avec self-attention
-- Encodeur-décodeur avec skip connections
-- Time embedding positionnel
-- Modules d'attention multi-têtes
-
-## 📊 Monitoring
-
-L'entraînement est monitoré avec TensorBoard :
-
-```bash
-tensorboard --logdir runs/
-```
-
-Métriques suivies :
-
-- MSE Loss
-- Gradient Norm
-- Learning Rate
-- Images générées à chaque époque
-
-## 📝 Notes
-
-### Paramètres importants
-
-- **T (noise_steps)** : Nombre de pas de diffusion. Plus élevé = meilleure qualité mais plus lent
-- **Beta schedule** : Contrôle la vitesse d'ajout de bruit (beta_start → beta_end)
-- **Batch size** : 128 pour MNIST, 64 pour CryptoPunks (ajuster selon la VRAM)
-- **Image size** : 16x16 pour MNIST, 32x32 pour CryptoPunks
-
-### Résultats attendus
-
-- **MNIST** : Génération de chiffres réalistes après ~50 époques
-- **CryptoPunks** : Génération de portraits pixelisés après ~100 époques
-
-## 🔧 Personnalisation
-
-Pour créer votre propre configuration, éditez `config.py` :
-
-```python
-custom_config = {
-    "dataset_name": "MNIST",
-    "epochs": 100,
-    "lr": 3e-4,
-    "T": 500,
-    "batch_size": 128,
-    "beta_start": 1e-4,
-    "beta_end": 0.02,
-}
-```
+---
 
 ## 📚 Références
 
-- [Denoising Diffusion Probabilistic Models (DDPM)](https://arxiv.org/abs/2006.11239)
-- [Improved Denoising Diffusion Probabilistic Models](https://arxiv.org/abs/2102.09672)
+- [Concept Sliders: LoRA Adaptors for Precise Control in Diffusion Models (Gandikota et al., 2023)](https://arxiv.org/abs/2311.17216)
+- [Denoising Diffusion Probabilistic Models (Ho et al., 2020)](https://arxiv.org/abs/2006.11239)
+- [CryptoPunks Dataset](https://www.kaggle.com/datasets/chwasiq0569/cryptopunks-pixel-art-dataset)
+
+---
+
+## ✅ Approche Alternative (Fonctionnelle)
+
+Face à l'échec de la méthode Concept Sliders, une approche alternative a été implémentée : **entraîner le modèle directement avec conditionnement sur les accessoires**.
+
+- [src/model_conditioned.py](src/model_conditioned.py) : UNet avec embedding learnable (multi-hot → concept 512D)
+- [src/train_ddpm_conditioned.py](src/train_ddpm_conditioned.py) : Entraînement end-to-end avec CFG dropout
+- [app.py](app.py) : Interface Streamlit pour la génération
+
+Cette approche fonctionne car le modèle apprend dès le départ à utiliser les vecteurs d'accessoires, plutôt que d'essayer d'injecter des concepts dans un espace non préparé.
+
+```bash
+# Entraînement conditionné
+python src/train_ddpm_conditioned.py --epochs 50
+
+# Interface de génération
+streamlit run app.py
+```
+
+---
 
 ## 📄 Licence
 
-Voir le fichier [LICENSE](LICENSE) pour plus de détails.
+MIT License
+
+## 📄 Licence
+
+MIT License - voir [LICENSE](LICENSE) pour plus de détails.
+
+---
+
+## 👤 Auteur
+
+Projet Deep Learning - EPITA S9 (2025-2026)
